@@ -1,0 +1,44 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Local machine configuration
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Local agent/skill installations
+.agents/
+skills-lock.json
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Experimental output and exported data
+export/
+scan_data/
+trigger_data/
+step_scan_data/
+*.dat
+*.npy
+*.npz
+*.csv
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.bak
+~$*
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+desktop.ini
