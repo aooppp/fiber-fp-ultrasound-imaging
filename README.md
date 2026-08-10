@@ -51,7 +51,7 @@ MC600 位移台 -> X/Y 扫描 -> B-scan 数据
 ## 安装与运行
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/aooppp/fiber-fp-ultrasound-imaging.git
 cd ultrasound_imaging
 
 python -m venv .venv
