@@ -207,6 +207,7 @@ class ScanPanel(QWidget):
             "trigger_slope": config.DAQ_TRIGGER_SLOPE,
             "trigger_sensitivity": config.DAQ_TRIGGER_SENSITIVITY,
             "input_range": config.DAQ_RANGE,
+            "input_impedance": config.DAQ_IMPEDANCE,
             "save_path": os.path.join(os.path.dirname(os.path.dirname(__file__)), "scan_data"),
         }
         self._init_ui()
@@ -271,6 +272,20 @@ class ScanPanel(QWidget):
         self.input_range_combo.setToolTip("选择 PCIe8526 模拟输入量程")
         self.input_range_combo.currentIndexChanged.connect(self._on_input_range_changed)
         range_row.addWidget(self.input_range_combo, 1)
+
+        range_row.addWidget(QLabel("输入阻抗"))
+        self.input_impedance_combo = QComboBox()
+        self.input_impedance_combo.addItem("50 Ω", 1)
+        self.input_impedance_combo.addItem("1 MΩ", 0)
+        impedance_index = self.input_impedance_combo.findData(self._adv["input_impedance"])
+        self.input_impedance_combo.setCurrentIndex(max(0, impedance_index))
+        self.input_impedance_combo.setToolTip(
+            "必须与 LabVIEW 例程一致；阻抗不一致会直接改变测得幅值"
+        )
+        self.input_impedance_combo.currentIndexChanged.connect(
+            self._on_input_impedance_changed
+        )
+        range_row.addWidget(self.input_impedance_combo, 1)
         ops_layout.addLayout(range_row)
 
         trigger_row = QHBoxLayout()
@@ -366,6 +381,18 @@ class ScanPanel(QWidget):
         range_text = "±1 V" if range_idx == 1 else "±5 V"
         self.status_update.emit(f"输入量程已设置为 {range_text}")
 
+    def _apply_input_impedance(self):
+        impedance = int(self.input_impedance_combo.currentData())
+        self._adv["input_impedance"] = impedance
+        if self.daq is not None:
+            self.daq.impedance = impedance
+        return impedance
+
+    def _on_input_impedance_changed(self, _index=None):
+        impedance = self._apply_input_impedance()
+        impedance_text = "50 Ω" if impedance == 1 else "1 MΩ"
+        self.status_update.emit(f"输入阻抗已设置为 {impedance_text}")
+
     def _toggle_stage_connection(self):
         if self.mc600 is None:
             port = self.stage_port_combo.currentText()
@@ -432,7 +459,7 @@ class ScanPanel(QWidget):
                     sample_length=config.DAQ_SAMPLE_LENGTH,
                     range_idx=self._apply_input_range(),
                     coupling=config.DAQ_COUPLING,
-                    impedance=config.DAQ_IMPEDANCE,
+                    impedance=self._apply_input_impedance(),
                     trigger_source="DTR",
                     trigger_level=config.DAQ_TRIGGER_LEVEL,
                     trigger_slope=self.trigger_slope_combo.currentData(),
@@ -443,7 +470,8 @@ class ScanPanel(QWidget):
                 self.daq_connect_btn.setText("断开")
                 self._check_scan_ready()
                 self.status_update.emit(
-                    f"采集卡已配置: {device}，输入量程 {self.input_range_combo.currentText()}"
+                    f"采集卡已配置: {device}，输入量程 {self.input_range_combo.currentText()}，"
+                    f"输入阻抗 {self.input_impedance_combo.currentText()}"
                 )
             except Exception as e:
                 QMessageBox.critical(self, "连接失败", f"无法连接采集卡: {e}")
@@ -482,10 +510,12 @@ class ScanPanel(QWidget):
         if self.daq is None:
             return
         self._apply_input_range()
+        self._apply_input_impedance()
         slope, sensitivity = self._apply_trigger_settings()
         edge_text = "上升沿" if slope else "下降沿"
         self.status_update.emit(
-            f"采集设置: {self.input_range_combo.currentText()}，DTR {edge_text}，灵敏度 {sensitivity}"
+            f"采集设置: {self.input_range_combo.currentText()}，"
+            f"{self.input_impedance_combo.currentText()}，DTR {edge_text}，灵敏度 {sensitivity}"
         )
         if self.mode_combo.currentIndex() == 0:
             self._start_stage_scan()
@@ -513,6 +543,7 @@ class ScanPanel(QWidget):
 
         self._scanning = True
         self.input_range_combo.setEnabled(False)
+        self.input_impedance_combo.setEnabled(False)
         self.scan_btn.setText("扫描中...")
         self.stop_btn.setEnabled(True)
 
@@ -534,6 +565,7 @@ class ScanPanel(QWidget):
     def _start_trigger_scan(self):
         self._scanning = True
         self.input_range_combo.setEnabled(False)
+        self.input_impedance_combo.setEnabled(False)
         self.scan_btn.setText("采集中...")
         self.stop_btn.setEnabled(True)
         from workers.scan_worker import TriggerWorker
@@ -553,6 +585,7 @@ class ScanPanel(QWidget):
     def _stop_scan(self):
         self._scanning = False
         self.input_range_combo.setEnabled(True)
+        self.input_impedance_combo.setEnabled(True)
         if self._scan_thread:
             self._scan_thread.stop()
             self._scan_thread = None
@@ -580,6 +613,7 @@ class ScanPanel(QWidget):
     def _on_scan_finished(self, data, positions):
         self._scanning = False
         self.input_range_combo.setEnabled(True)
+        self.input_impedance_combo.setEnabled(True)
         self.scan_btn.setText("开始扫描")
         self.stop_btn.setEnabled(False)
         if data is not None:

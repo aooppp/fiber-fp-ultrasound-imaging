@@ -196,6 +196,7 @@ class ScanWorker(QThread):
             'trigger_sensitivity': int(self.daq.trigger_sensitivity),
             'input_range_index': int(self.daq.range_idx),
             'input_range_v': 1.0 if int(self.daq.range_idx) == 1 else 5.0,
+            'input_impedance_ohm': 50 if int(self.daq.impedance) == 1 else 1000000,
             'voltage_unit': 'V',
             'driver_scale_to_v': float(config.DAQ_DRIVER_SCALE_TO_V),
         }
@@ -301,18 +302,31 @@ class TriggerWorker(QThread):
 
             # 裁剪有效数据并在采集结束后统一换算为伏特。
             all_data = all_data[:ok]
+            raw_min = float(np.min(all_data))
+            raw_max = float(np.max(all_data))
+            raw_peak_to_peak = raw_max - raw_min
             np.multiply(
                 all_data,
                 float(config.DAQ_DRIVER_SCALE_TO_V),
                 out=all_data,
             )
+            voltage_min = float(np.min(all_data))
+            voltage_max = float(np.max(all_data))
 
             # 确保不足一个UI刷新周期的短采集也显示最终进度与波形。
             self.progress.emit(ok, self.groups)
             self.waveform.emit(all_data[-1, :actual_len].copy())
 
             # 保存数据
-            self._save_data(all_data, ok, t1 - t0)
+            amplitude_stats = {
+                'driver_raw_min': raw_min,
+                'driver_raw_max': raw_max,
+                'driver_raw_peak_to_peak': raw_peak_to_peak,
+                'voltage_min_v': voltage_min,
+                'voltage_max_v': voltage_max,
+                'voltage_peak_to_peak_v': voltage_max - voltage_min,
+            }
+            self._save_data(all_data, ok, t1 - t0, amplitude_stats)
 
             self.finished.emit(all_data, None)
 
@@ -325,7 +339,7 @@ class TriggerWorker(QThread):
     def stop(self):
         self._running = False
 
-    def _save_data(self, data, groups_acquired, elapsed):
+    def _save_data(self, data, groups_acquired, elapsed, amplitude_stats=None):
         """保存触发采集数据 - 每次触发存一个dat文件（只存电压值）"""
         if self.save_path:
             save_dir = self.save_path
@@ -356,11 +370,14 @@ class TriggerWorker(QThread):
             'trigger_sensitivity': int(self.daq.trigger_sensitivity),
             'input_range_index': int(self.daq.range_idx),
             'input_range_v': 1.0 if int(self.daq.range_idx) == 1 else 5.0,
+            'input_impedance_ohm': 50 if int(self.daq.impedance) == 1 else 1000000,
             'acquisition_mode': 'FINITE_retrigger_single_start',
             'ui_update_rate_limit_hz': 10.0,
             'voltage_unit': 'V',
             'driver_scale_to_v': float(config.DAQ_DRIVER_SCALE_TO_V),
         }
+        if amplitude_stats:
+            meta.update(amplitude_stats)
         with open(os.path.join(save_dir, f'trigger_meta_{timestamp}.json'), 'w') as f:
             json.dump(meta, f, indent=2)
 

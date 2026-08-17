@@ -194,6 +194,7 @@ class FPWorkPointStabilizerPFI:
         self._scan_received_triggers = 0
         self._scan_samples_per_trigger = 0
         self._scan_timeout_count = 0
+        self._scan_point_spacing_nm = 0.0
         self._status_lock = threading.Lock()
         self._last_status = None
 
@@ -268,9 +269,16 @@ class FPWorkPointStabilizerPFI:
             return int(self.samples_per_trigger)
         return max(10, int(float(self.sample_rate) * trig_period_s * 0.8))
 
-    def _read_triggered_median_spectrum(self, trigger_count):
-        medians = []
+    def _read_triggered_spectrum(self, trigger_count, samples_per_trigger):
+        wavelength_blocks = []
+        voltage_blocks = []
         timeout_count = 0
+        received_triggers = 0
+        direction = 1.0 if self.scan_stop >= self.scan_start else -1.0
+        sample_step_nm = direction * abs(float(self.scan_speed)) / float(self.sample_rate)
+        scan_low = min(float(self.scan_start), float(self.scan_stop))
+        scan_high = max(float(self.scan_start), float(self.scan_stop))
+
         with artdaq.Task() as task:
             task.ai_channels.add_ai_voltage_chan(
                 self.daq.channel_str,
@@ -279,7 +287,7 @@ class FPWorkPointStabilizerPFI:
             task.timing.cfg_samp_clk_timing(
                 rate=float(self.sample_rate),
                 sample_mode=artdaq.constants.AcquisitionType.FINITE,
-                samps_per_chan=int(self.samples_per_trigger),
+                samps_per_chan=int(samples_per_trigger),
             )
             task.triggers.start_trigger.cfg_dig_edge_start_trig(
                 self._trigger_line(),
@@ -295,15 +303,35 @@ class FPWorkPointStabilizerPFI:
                 read_timeout = max(self.first_read_timeout_s, timeout_each) if i == 0 else max(self.trigger_timeout_s, timeout_each)
                 try:
                     block = task.read(
-                        number_of_samples_per_channel=int(self.samples_per_trigger),
+                        number_of_samples_per_channel=int(samples_per_trigger),
                         timeout=float(read_timeout),
                     )
-                    medians.append(float(np.median(np.asarray(block, dtype=float))))
+                    block = np.asarray(block, dtype=float).reshape(-1)
+                    if block.size == 0:
+                        continue
+
+                    trigger_wl = (
+                        float(self.scan_start)
+                        + direction * float(i) * abs(float(self.trigger_spacing_nm))
+                    )
+                    block_wl = trigger_wl + np.arange(block.size, dtype=float) * sample_step_nm
+                    in_scan = (block_wl >= scan_low) & (block_wl <= scan_high)
+                    if np.any(in_scan):
+                        wavelength_blocks.append(block_wl[in_scan])
+                        voltage_blocks.append(block[in_scan])
+                        received_triggers += 1
                 except Exception:
                     timeout_count += 1
                     if timeout_count >= 8:
                         break
-        return np.asarray(medians, dtype=float), timeout_count
+
+        if not voltage_blocks:
+            return np.array([], dtype=float), np.array([], dtype=float), timeout_count, 0
+
+        wl = np.concatenate(wavelength_blocks)
+        voltage = np.concatenate(voltage_blocks)
+        order = np.argsort(wl)
+        return wl[order], voltage[order], timeout_count, received_triggers
 
     def do_sweep(self):
         self.state = State.SWEEP
@@ -314,13 +342,13 @@ class FPWorkPointStabilizerPFI:
 
         self.daq.sample_rate = float(self.sample_rate)
         safe_n = self._safe_samples_per_trigger()
-        if self.samples_per_trigger > safe_n:
-            self.samples_per_trigger = safe_n
+        record_samples = min(int(self.samples_per_trigger), int(safe_n))
         self._scan_wl = None
         self._scan_v = None
-        self._scan_samples_per_trigger = int(self.samples_per_trigger)
+        self._scan_samples_per_trigger = int(record_samples)
         self._scan_received_triggers = 0
         self._scan_timeout_count = 0
+        self._scan_point_spacing_nm = 0.0
 
         self.laser.setup_sweep(self.scan_start, self.scan_stop, self.scan_speed)
         time.sleep(0.2)
@@ -332,15 +360,20 @@ class FPWorkPointStabilizerPFI:
 
         trigger_count = int(abs(sweep_range) / float(self.trigger_spacing_nm)) + 1
         self._scan_expected_triggers = int(trigger_count)
-        v, timeout_count = self._read_triggered_median_spectrum(trigger_count)
-        self._scan_received_triggers = int(v.size)
+        wl, v, timeout_count, received_triggers = self._read_triggered_spectrum(
+            trigger_count,
+            record_samples,
+        )
+        self._scan_received_triggers = int(received_triggers)
         self._scan_timeout_count = int(timeout_count)
         if v.size < 20:
             self.state = State.IDLE
             return
 
-        self._scan_wl = np.linspace(float(self.scan_start), float(self.scan_stop), v.size)
+        self._scan_wl = wl
         self._scan_v = v
+        if wl.size > 1:
+            self._scan_point_spacing_nm = float(np.median(np.diff(wl)))
         self.state = State.IDLE
 
     def get_scan_info(self):
@@ -350,6 +383,7 @@ class FPWorkPointStabilizerPFI:
             "samples_per_trigger": int(self._scan_samples_per_trigger),
             "timeout_count": int(self._scan_timeout_count),
             "sample_points": 0 if self._scan_v is None else int(self._scan_v.size),
+            "point_spacing_nm": float(self._scan_point_spacing_nm),
         }
 
     def _find_extrema(self, y: np.ndarray, n: int, y_raw: np.ndarray = None):
@@ -386,8 +420,18 @@ class FPWorkPointStabilizerPFI:
 
         return refine(peaks, "peak"), refine(valleys, "valley")
 
-    def _smooth_scan(self, v: np.ndarray):
+    def _smooth_scan(self, v: np.ndarray, wl: np.ndarray = None):
         win = int(self.wp_savgol_window)
+        if wl is not None and np.asarray(wl).size > 1:
+            spacing = float(np.median(np.diff(np.asarray(wl, dtype=float))))
+            if not np.isfinite(spacing) or spacing <= 0:
+                spacing = 0.0
+            # A fixed seven-point window is appropriate for the full trigger data
+            # (~0.001 nm/point), but would erase a sharp line on a coarse 0.1 nm grid.
+            if spacing >= 0.02:
+                return v.copy()
+            if spacing > 0:
+                win = max(5, min(21, int(round(0.007 / spacing))))
         if win % 2 == 0:
             win += 1
         win = min(win, v.size - (1 - v.size % 2))
@@ -419,7 +463,106 @@ class FPWorkPointStabilizerPFI:
         order = np.argsort(wl0)
         wl_u = wl0[order]
         v_u = v0[order]
-        v_s = self._smooth_scan(v_u)
+        v_s = self._smooth_scan(v_u, wl_u)
+
+        # Find prominent peaks/valleys and calculate their half-prominence
+        # crossings directly. This remains stable for very narrow FP resonances
+        # and estimates the slope locally instead of fitting the entire edge.
+        try:
+            from scipy.signal import find_peaks, peak_widths
+
+            spacing = float(np.median(np.diff(wl_u)))
+            dv = np.diff(v_s)
+            noise = 0.0
+            if dv.size:
+                noise = float(
+                    1.4826
+                    * np.median(np.abs(dv - np.median(dv)))
+                    / np.sqrt(2.0)
+                )
+            prominence_min = max(float(self.wp_min_contrast), 6.0 * noise)
+            min_distance = max(2, int(round(0.01 / max(spacing, 1e-12))))
+            sample_axis = np.arange(wl_u.size, dtype=float)
+            half_height_candidates = []
+
+            for polarity in (1.0, -1.0):
+                signal = polarity * v_s
+                extrema_idx, properties = find_peaks(
+                    signal,
+                    prominence=prominence_min,
+                    distance=min_distance,
+                )
+                if extrema_idx.size == 0:
+                    continue
+
+                _, half_heights, left_ips, right_ips = peak_widths(
+                    signal,
+                    extrema_idx,
+                    rel_height=0.5,
+                )
+                for extremum_idx, half_height, left_ip, right_ip, prominence in zip(
+                    extrema_idx,
+                    half_heights,
+                    left_ips,
+                    right_ips,
+                    properties["prominences"],
+                ):
+                    for crossing_ip in (left_ip, right_ip):
+                        work_wl = float(np.interp(crossing_ip, sample_axis, wl_u))
+                        edge_span = abs(work_wl - float(wl_u[int(extremum_idx)]))
+                        if edge_span < max(0.003, 2.0 * spacing):
+                            continue
+
+                        fit_span_nm = max(0.004, min(0.02, 0.35 * edge_span))
+                        fit_radius = max(
+                            2,
+                            min(12, int(round(fit_span_nm / max(spacing, 1e-12)))),
+                        )
+                        center_idx = int(round(float(crossing_ip)))
+                        fit_start = max(0, center_idx - fit_radius)
+                        fit_stop = min(wl_u.size, center_idx + fit_radius + 1)
+                        if fit_stop - fit_start < 3:
+                            continue
+
+                        fit_wl = wl_u[fit_start:fit_stop]
+                        fit_v = v_s[fit_start:fit_stop]
+                        slope, _ = np.polyfit(fit_wl, fit_v, 1)
+                        corr = np.corrcoef(fit_wl, fit_v)[0, 1]
+                        linearity = abs(float(corr)) if np.isfinite(corr) else 0.0
+                        if linearity < float(self.wp_linearity_min):
+                            continue
+
+                        half_height_candidates.append(
+                            {
+                                "score": abs(float(slope)),
+                                "slope": float(slope),
+                                "work_v": float(polarity * half_height),
+                                "work_wl": work_wl,
+                                "edge_span": float(edge_span),
+                                "prominence": float(prominence),
+                                "linearity": linearity,
+                            }
+                        )
+
+            if half_height_candidates:
+                best = max(
+                    half_height_candidates,
+                    key=lambda c: (c["score"], c["prominence"], c["linearity"]),
+                )
+                self.workpoint_wl = float(best["work_wl"])
+                self.workpoint_v = float(best["work_v"])
+                self.workpoint_slope = float(best["slope"])
+                self.lock_range_nm = max(
+                    0.003,
+                    3.0 * spacing,
+                    0.45 * float(best["edge_span"]),
+                )
+                self.workpoint_mode = "auto"
+                self.state = State.SET
+                return
+        except Exception:
+            # Keep the previous adjacent-extrema method as a SciPy-free fallback.
+            pass
 
         peaks, valleys = self._find_extrema(v_s, self.wp_extrema_n, y_raw=v_u)
         extrema = [(int(i), "peak") for i in peaks] + [(int(i), "valley") for i in valleys]
